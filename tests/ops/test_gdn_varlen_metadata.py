@@ -12,53 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-runnable contract tests for ``precompute_varlen_metadata`` introduced in the
-AscendC GDN precomputation path (PR #999).
-
-The module under test pulls in ``torch_npu``, ``fla_npu``, and vendored Triton
-kernels at the top level; those are mocked so the tests run on any host (CPU/GPU/Mac).
-"""
+"""CPU-runnable contract tests for gated-delta-rule varlen metadata."""
 
 from __future__ import annotations
 
+import ast
+import os
+import subprocess
 import sys
-from unittest.mock import MagicMock
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Mock NPU dependencies so ``flash_gated_delta_rule`` can be imported on CPU.
-# ---------------------------------------------------------------------------
-
-
-def _install_npu_mocks() -> None:
-    """Pre-populate ``sys.modules`` with stubs for every NPU / Triton dep."""
-    _TL = MagicMock(__path__=[], __spec__=MagicMock())
-    _TRITON = MagicMock(language=_TL, __version__="3.2.0", __path__=[], __spec__=MagicMock())
-
-    _TRITON_SUBS = [
-        "triton.language.extra",
-        "triton.language.extra.libdevice",
-        "triton.language.extra.cann",
-        "triton.language.extra.cann.extension",
-        "triton.runtime",
-        "triton.runtime.driver",
-    ]
-
-    _MOCKS: dict[str, object] = {
-        "torch_npu": MagicMock(),
-        "fla_npu": MagicMock(),
-        "triton": _TRITON,
-        "triton.language": _TL,
-    }
-    for sub in _TRITON_SUBS:
-        _MOCKS[sub] = MagicMock(__path__=[], __spec__=MagicMock())
-
-    for name, mock in _MOCKS.items():
-        if name not in sys.modules:
-            sys.modules[name] = mock
+GENERATED_NPU_MODELS = (
+    "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+    "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -77,15 +49,52 @@ def _make_cu_seqlens(*lengths: int) -> torch.LongTensor:
 
 
 class TestPrecomputeVarlenMetadataContract:
-    """Verify ``precompute_varlen_metadata`` produces the same metadata as the
-    per-layer ``_ensure_varlen_metadata`` fallback."""
+    """Verify the backend-independent varlen metadata contract."""
 
     @pytest.fixture(scope="class")
     def module(self):
-        _install_npu_mocks()
-        from veomni.ops.kernels.gated_delta_rule._ascend import flash_gated_delta_rule as m
+        from veomni.ops.kernels.gated_delta_rule import varlen_metadata as m
 
         return m
+
+    def test_file_cold_import_does_not_load_ascend_dependencies(self) -> None:
+        """The helper module itself must remain independent of Ascend backends."""
+        module_path = Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/varlen_metadata.py"
+        script = textwrap.dedent(
+            f"""
+            import builtins
+            import importlib.util
+
+            original_import = builtins.__import__
+
+            def reject_ascend_imports(name, *args, **kwargs):
+                if name in {{"fla_npu", "torch_npu"}} or name.startswith("triton"):
+                    raise AssertionError(f"unexpected Ascend dependency import: {{name}}")
+                return original_import(name, *args, **kwargs)
+
+            builtins.__import__ = reject_ascend_imports
+            spec = importlib.util.spec_from_file_location("varlen_metadata_cold_import", {str(module_path)!r})
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            assert callable(module.precompute_varlen_metadata)
+            """
+        )
+        env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+        subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, env=env)
+
+    def test_package_cold_import_without_fla_npu(self) -> None:
+        """The generated model's full import path must work without the optional AscendC package."""
+        script = textwrap.dedent(
+            """
+            import importlib
+            import sys
+
+            sys.modules["fla_npu"] = None
+            module = importlib.import_module("veomni.ops.kernels.gated_delta_rule.varlen_metadata")
+            assert callable(module.precompute_varlen_metadata)
+            """
+        )
+        subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
 
     @pytest.mark.parametrize(
         "lengths,chunk_size,num_heads",
@@ -101,8 +110,7 @@ class TestPrecomputeVarlenMetadataContract:
         chunk_size: int,
         num_heads: int,
     ) -> None:
-        """``precompute_varlen_metadata`` must produce the same keys/values as
-        ``_ensure_varlen_metadata`` when called with matching parameters."""
+        """Precomputed tensors and lists must match an independent Python reference."""
         cu_seqlens = _make_cu_seqlens(*lengths)
         cu_seqlens_list, chunk_indices, chunk_indices_list = module.precompute_varlen_metadata(
             cu_seqlens=cu_seqlens,
@@ -110,44 +118,70 @@ class TestPrecomputeVarlenMetadataContract:
             chunk_size=chunk_size,
         )
 
-        # Compare against _ensure_varlen_metadata.
-        # _ensure_varlen_metadata needs a gate tensor to derive head count and
-        # device info.  Shape: [B, T, H]; h = num_heads so the cumsum-block
-        # computation inside both functions produces the same key set.
-        B, T = 2, sum(lengths)
-        g = torch.zeros(B, T, num_heads)
+        assert cu_seqlens_list == cu_seqlens.tolist()
+        cumsum_block_size = 1 << (((1 << 17) // (num_heads * chunk_size)) - 1).bit_length()
+        expected_sizes = {16, 32, 64, 128, 608 * 2, chunk_size, cumsum_block_size}
+        assert set(chunk_indices) == {str(size) for size in expected_sizes}
+        assert set(chunk_indices_list) == {str(size) for size in expected_sizes}
 
-        _, ref_list, ref_tensor, ref_list_dict = module._ensure_varlen_metadata(
-            g=g,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_list=None,
-            chunk_indices=None,
-            chunk_indices_list=None,
-            chunk_size=chunk_size,
+        for size in expected_sizes:
+            expected: list[int] = []
+            for seq_idx, length in enumerate(lengths):
+                for index in range((length + size - 1) // size):
+                    expected.extend([seq_idx, index])
+
+            assert chunk_indices_list[str(size)] == expected
+            assert chunk_indices[str(size)].tolist() == [expected[i : i + 2] for i in range(0, len(expected), 2)]
+
+
+@pytest.mark.parametrize("relative_path", GENERATED_NPU_MODELS)
+def test_generated_model_only_passes_precomputed_metadata_to_ascendc(relative_path: str) -> None:
+    """Backend-specific metadata must not leak into third-party kernel signatures."""
+    tree = ast.parse((Path(__file__).parents[2] / relative_path).read_text())
+    forbidden_keywords = {"cu_seqlens_list", "chunk_indices", "chunk_indices_list"}
+
+    kernel_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "chunk_gated_delta_rule"
+    ]
+    assert kernel_calls
+    for call in kernel_calls:
+        assert forbidden_keywords.isdisjoint(keyword.arg for keyword in call.keywords)
+        assert any(
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "precomputed_metadata_kwargs"
+            for keyword in call.keywords
         )
 
-        # cu_seqlens_list
-        assert cu_seqlens_list == ref_list
-
-        # Both dicts must cover the same key set
-        assert set(chunk_indices.keys()) == set(ref_tensor.keys())
-        assert set(chunk_indices_list.keys()) == set(ref_list_dict.keys())
-
-        for key in chunk_indices:
-            pre_t = chunk_indices[key]
-            ref_t = ref_tensor[key]
-            if pre_t is None:
-                assert ref_t is None
-            else:
-                assert ref_t is not None
-                assert pre_t.shape == ref_t.shape
-                assert pre_t.tolist() == ref_t.tolist(), f"mismatch at key={key}"
-
-        for key in chunk_indices_list:
-            pre_l = chunk_indices_list[key]
-            ref_l = ref_list_dict[key]
-            if pre_l is None:
-                assert ref_l is None
-            else:
-                assert ref_l is not None
-                assert pre_l == ref_l, f"mismatch at key={key}"
+    ascendc_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(comparator, ast.Constant) and comparator.value == "npu_ascendc"
+            for expression in ast.walk(node.test)
+            if isinstance(expression, ast.Compare)
+            for comparator in expression.comparators
+        )
+    ]
+    assert any(
+        isinstance(descendant, ast.Subscript)
+        and isinstance(descendant.value, ast.Name)
+        and descendant.value.id == "precomputed_metadata_kwargs"
+        and isinstance(descendant.ctx, ast.Store)
+        for guard in ascendc_guards
+        for statement in guard.body
+        for descendant in ast.walk(statement)
+    )
+    assert any(
+        isinstance(descendant, ast.Call)
+        and isinstance(descendant.func, ast.Name)
+        and descendant.func.id == "precompute_varlen_metadata"
+        for guard in ascendc_guards
+        for statement in guard.body
+        for descendant in ast.walk(statement)
+    )

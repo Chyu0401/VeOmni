@@ -771,6 +771,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
+                precomputed_metadata_kwargs = {}
+                from veomni.ops.config.singleton import get_ops_config
+
+                ops_config = get_ops_config()
+                if ops_config is not None and ops_config.chunk_gated_delta_rule_implementation == "npu_ascendc":
+                    if cu_seqlens_list is not None:
+                        precomputed_metadata_kwargs["cu_seqlens_list"] = cu_seqlens_list
+                    if chunk_indices is not None:
+                        precomputed_metadata_kwargs["chunk_indices"] = chunk_indices
+                    if chunk_indices_list is not None:
+                        precomputed_metadata_kwargs["chunk_indices_list"] = chunk_indices_list
                 core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                     query,
                     key,
@@ -781,9 +792,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
                     cu_seqlens=cu_seq_lens_q.npu(),
-                    cu_seqlens_list=cu_seqlens_list,
-                    chunk_indices=chunk_indices,
-                    chunk_indices_list=chunk_indices_list,
+                    **precomputed_metadata_kwargs,
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -1785,8 +1794,16 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
         # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-        if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-            from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata
+        from veomni.ops.config.singleton import get_ops_config
+
+        ops_config = get_ops_config()
+        if (
+            ops_config is not None
+            and ops_config.chunk_gated_delta_rule_implementation == "npu_ascendc"
+            and cu_seq_lens_q is not None
+            and "cu_seqlens_list_q" not in kwargs
+        ):
+            from veomni.ops.kernels.gated_delta_rule.varlen_metadata import precompute_varlen_metadata
 
             # Use the Ulysses-local head count so that the precomputed cumsum-block
             # key matches the per-layer _ensure_varlen_metadata computation (which
